@@ -1,0 +1,11 @@
+# Artefatos de build — publicados como release assets, nunca no git
+dist/
+node_modules/
+
+# Ambiente / segredos
+.env
+*.log
+
+# SO
+.DS_Store
+Thumbs.db
