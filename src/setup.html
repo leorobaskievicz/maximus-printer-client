@@ -55,6 +55,16 @@
     }
     .toggle.on::after { transform: translateX(16px); }
     .empty { padding: 32px 16px; text-align: center; color: #4a5166; font-size: 13px; }
+    /* O compartilhamento era um switch sem rótulo no canto da linha: quem
+       instalava o client não descobria que faltava esse passo, e no Hub a
+       lista de impressoras aparecia vazia sem explicação. */
+    .share-box { display: flex; flex-direction: column; align-items: center; gap: 4px; flex-shrink: 0; }
+    .share-label { font-size: 10px; color: #7a8196; white-space: nowrap; }
+    .aviso-share {
+      display: flex; gap: 8px; align-items: flex-start;
+      background: #2a2113; border: 1px solid #4a3a17; border-radius: 8px;
+      padding: 10px 14px; margin-bottom: 14px; font-size: 12px; color: #e8c37a;
+    }
     .footer { margin-top: 16px; display: flex; gap: 8px; justify-content: flex-end; }
     .loading { text-align: center; padding: 32px; color: #4a5166; }
     .spinner {
@@ -106,6 +116,7 @@
       <span class="card-title">Impressoras neste PC</span>
       <button class="btn-sm secondary" onclick="recarregar()"><span id="sync-icon">↻</span> Atualizar</button>
     </div>
+    <div id="aviso-share" style="display:none"></div>
     <div id="lista"><div class="loading"><span class="spinner"></span></div></div>
   </div>
 
@@ -191,9 +202,12 @@
                         title="Imprime etiqueta de teste com a configuração atual">🖨 Teste</button>
               </div>
             </div>
-            <button class="toggle ${shared ? 'on' : ''}" id="toggle-${i}"
-                    onclick="alternarCompartilhar(${i}, this)"
-                    title="${shared ? 'Compartilhado no HUB' : 'Não compartilhado'}"></button>
+            <div class="share-box">
+              <span class="share-label" id="share-label-${i}">${shared ? 'Compartilhada' : 'Compartilhar'}</span>
+              <button class="toggle ${shared ? 'on' : ''}" id="toggle-${i}"
+                      onclick="alternarCompartilhar(${i}, this)"
+                      title="${shared ? 'Compartilhada com o Hub' : 'Ligue para o Hub enxergar esta impressora'}"></button>
+            </div>
           </div>
         `
       }).join('')
@@ -208,11 +222,36 @@
         p._hub_id   = hub.id
         p._agent_uuid = agentUuid
       })
+
+      atualizarAvisoShare()
+    }
+
+    /**
+     * Sem nenhuma impressora compartilhada, o Hub mostra "Nenhuma impressora
+     * disponível" e o operador não tem como adivinhar que o passo que falta
+     * está AQUI, neste PC. O aviso fecha essa distância.
+     */
+    function atualizarAvisoShare () {
+      const caixa = document.getElementById('aviso-share')
+      if (!caixa) return
+      const algumaCompartilhada = impressoras.some(p => p._shared)
+      if (algumaCompartilhada || impressoras.length === 0) {
+        caixa.style.display = 'none'
+        return
+      }
+      caixa.className = 'aviso-share'
+      caixa.style.display = 'flex'
+      caixa.innerHTML = '<span>⚠️</span><span>Nenhuma impressora está compartilhada. '
+        + 'Enquanto isso, o MaximusHub mostra a lista de impressoras vazia na hora de imprimir. '
+        + 'Ligue <b>Compartilhar</b> na impressora que a expedição usa — e, se for Zebra, escolha o tipo <b>ZPL</b>.</span>'
     }
 
     function alternarCompartilhar (i, btn) {
       impressoras[i]._shared = !impressoras[i]._shared
       btn.classList.toggle('on', impressoras[i]._shared)
+      const rotulo = document.getElementById(`share-label-${i}`)
+      if (rotulo) rotulo.textContent = impressoras[i]._shared ? 'Compartilhada' : 'Compartilhar'
+      atualizarAvisoShare()
     }
 
     function atualizarTipo (i, valor) {
