@@ -1,0 +1,55 @@
+# Publica o instalador Windows do Print Client.
+#
+# ⚠️ **Roda em `windows-latest`, e isso não é preferência.** O instalador NSIS
+# precisa EXECUTAR o próprio stub para embutir o payload; num Mac ARM isso
+# depende de wine sob qemu, que aborta
+# (`anon_mmap_fixed: Assertion !((UINT_PTR)start & host_page_mask)`) e deixa
+# um `.exe` de 153 KB sem conteúdo — um instalador que parece pronto e não é.
+# Tentado em 09/10/2026 antes de criar este workflow.
+#
+# ⚠️ `GITHUB_TOKEN` é o do próprio Actions: o electron-builder cria o release
+# e sobe `.exe` + `latest.yml`, que é o arquivo que o `electron-updater`
+# consulta nos clientes. Sem ele no release, ninguém atualiza.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      versao:
+        description: 'Versão a publicar (ex.: 1.0.4) — tem de bater com o package.json'
+        required: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Instalar dependências
+        run: npm ci
+
+      # A fila de impressão e a junção de PDF têm teste puro — barato rodar
+      # aqui, e é o que impede publicar um cliente que perde etiqueta.
+      - name: Testes
+        run: npm test
+
+      - name: Conferir a versão
+        shell: bash
+        run: |
+          atual=$(node -p "require('./package.json').version")
+          if [ "$atual" != "${{ inputs.versao }}" ]; then
+            echo "package.json está em $atual e o disparo pediu ${{ inputs.versao }}"
+            exit 1
+          fi
+
+      - name: Build e publicação
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder --win --x64 --publish always
