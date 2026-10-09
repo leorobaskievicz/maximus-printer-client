@@ -176,12 +176,17 @@ function conectarMqtt (token) {
     await sincronizarImpressoras(token, agentUuid)
   })
 
-  mqttClient.on('message', async (topic, payload) => {
+  mqttClient.on('message', (topic, payload) => {
     try {
       const job = JSON.parse(payload.toString())
-      await executarImpressao(job, token, userId, agentUuid)
+      // ⚠️ NÃO imprime aqui — enfileira. Ver `enfileirar` e o cabeçalho da
+      // seção de impressão: imprimir direto no handler fazia uma chamada ao
+      // SumatraPDF por etiqueta, e era isso que criava a pausa entre uma e
+      // outra. Também não havia fila: dois `await` em voo podiam disputar a
+      // mesma impressora e inverter a ordem do papel.
+      enfileirar(job, userId)
     } catch (err) {
-      console.error('[MQTT] Erro ao processar job:', err.message)
+      console.error('[MQTT] Erro ao ler job:', err.message)
     }
   })
 
@@ -201,32 +206,70 @@ function reconectar () {
 }
 
 // ─── Impressão ────────────────────────────────────────────────────────────────
+//
+// ══════════════════════════════════════════════════════════════════════════
+// ⚠️ POR QUE EXISTE UMA FILA, E POR QUE ELA AGRUPA (09/10/2026)
+// ══════════════════════════════════════════════════════════════════════════
+// Reclamação: "a cada etiqueta que sai tem uma pequena pausa pra iniciar a
+// próxima, não é contínuo".
+//
+// Medido no Hub: **99% dos jobs são de UMA etiqueta** (8.606 de 8.676 num dia)
+// e o servidor publica a cada ~0,5 s. Ou seja, o gargalo não era o envio — era
+// o que este arquivo fazia com cada job: reescrever o PDF, gravar um arquivo
+// temporário e **chamar o SumatraPDF**. Criar esse processo, carregar o PDF,
+// falar com o spooler e fechar custa centenas de milissegundos — por etiqueta.
+// É exatamente a pausa que a expedição vê entre uma e outra.
+//
+// A correção não é "deixar mais rápido": é **parar de fazer N vezes o que
+// pode ser feito uma vez**. As etiquetas de uma rajada viram UM PDF de N
+// páginas e UMA chamada à impressora; o papel sai contínuo, que é como a
+// térmica trabalha melhor.
+//
+// ⚠️ **Sem janela de espera, de propósito.** O agrupamento é oportunista: a
+// fila ociosa dispara NA HORA com o que tiver (uma etiqueta avulsa continua
+// instantânea, sem nenhum atraso novo); as que chegam ENQUANTO o lote
+// imprime se acumulam e saem juntas no ciclo seguinte. Quanto maior a
+// rajada, maior o lote — sem nenhum temporizador para calibrar, e sem
+// penalizar o clique único, que é o caso mais comum fora da onda.
+//
+// ⚠️ **Uma fila por DESTINO** (impressora + tipo + escala). Misturar
+// impressoras numa fila só serializaria duas que podiam imprimir em paralelo;
+// misturar escalas num PDF só é impossível — a escala é do documento inteiro.
+//
+// ⚠️ **Lote que falha é refeito UM A UM.** Um PDF corrompido no meio não pode
+// derrubar as outras 24 etiquetas: o erro vira ACK só para quem falhou.
 
-async function executarImpressao (job, token, userId, agentUuid) {
-  const { job_uuid, printer_system_name, type, data, zpl_host, zpl_port } = job
-  let status = 'success'
-  let errorMsg = null
+const { criarFilaDeImpressao } = require('./src/fila-impressao')
 
-  try {
-    const buffer = Buffer.from(data, 'base64')
-
-    if (type === 'zpl') {
-      await imprimirZpl(buffer, zpl_host, zpl_port || 9100, printer_system_name)
+/**
+ * A fila — a regra mora em `src/fila-impressao.js` (pura, com teste). Aqui
+ * ficam só as PONTAS: falar com a impressora e publicar o ACK no MQTT.
+ */
+const filaDeImpressao = criarFilaDeImpressao({
+  imprimir: async (lote) => {
+    const { job } = lote[0]
+    const buffers = lote.map((i) => Buffer.from(i.job.data, 'base64'))
+    if (job.type === 'zpl') {
+      // ⚠️ ZPL é um fluxo de comandos (`^XA`…`^XZ` por etiqueta): concatenar
+      // é o formato nativo de mandar várias. Um socket, não N.
+      await imprimirZpl(Buffer.concat(buffers), job.zpl_host, job.zpl_port || 9100, job.printer_system_name)
     } else {
-      await imprimirPdf(buffer, printer_system_name)
+      await imprimirPdf(buffers, job.printer_system_name, job.escala)
     }
-  } catch (err) {
-    status   = 'error'
-    errorMsg = err.message
-    console.error(`[PRINT] Falha no job ${job_uuid}:`, err.message)
-  }
+  },
+  confirmar: (item, status, erro) => {
+    if (!mqttClient) return
+    mqttClient.publish(
+      `hub/ack/${item.userId}/${item.job.job_uuid}`,
+      JSON.stringify({ job_uuid: item.job.job_uuid, status, error: erro }),
+      { qos: 1 }
+    )
+  },
+  registrar: (m) => console.log(`[print] ${m}`),
+})
 
-  // Publica ack
-  mqttClient.publish(
-    `hub/ack/${userId}/${job_uuid}`,
-    JSON.stringify({ job_uuid, status, error: errorMsg }),
-    { qos: 1 }
-  )
+function enfileirar (job, userId) {
+  return filaDeImpressao.enfileirar(job, userId)
 }
 
 // Escala de impressão por impressora (local). Modos:
@@ -244,14 +287,30 @@ async function executarImpressao (job, token, userId, agentUuid) {
 //   string ('auto'|'noscale'|...)        — formato legado
 //   { mode: 'label'|'custom'|..., pct }  — formato novo
 const ESCALAS_PDF = ['label', 'custom', 'auto', 'noscale', 'shrink', 'fit']
-function obterConfigEscala (printerName) {
+/**
+ * ⚠️ **A escala do SERVIDOR vence a configuração local** (08/10/2026).
+ *
+ * Etiqueta de marketplace é 100×150 mm por definição — não é preferência de
+ * cada máquina. Enquanto a decisão era só local, o operador de SP estava com
+ * `noscale` e a etiqueta saía pequena, sem nada errado no servidor: o PDF que
+ * chegava já era 100×150 (medido payload contra payload, Adonis e porte
+ * idênticos). O que faltava era o Hub DIZER como imprimir.
+ *
+ * ⚠️ A config local continua valendo quando o servidor não manda nada — é o
+ * que mantém o client velho funcionando e permite a exceção pontual (papel
+ * diferente numa máquina específica).
+ */
+function obterConfigEscala (printerName, escalaDoServidor) {
+  if (typeof escalaDoServidor === 'string' && ESCALAS_PDF.includes(escalaDoServidor)) {
+    return { mode: escalaDoServidor, pct: 100, origem: 'servidor' }
+  }
   const map = store.get('pdf_scale_by_printer') || {}
   const v = map[printerName]
-  if (typeof v === 'string' && ESCALAS_PDF.includes(v)) return { mode: v, pct: 100 }
+  if (typeof v === 'string' && ESCALAS_PDF.includes(v)) return { mode: v, pct: 100, origem: 'local' }
   if (v && typeof v === 'object' && ESCALAS_PDF.includes(v.mode)) {
-    return { mode: v.mode, pct: Math.min(300, Math.max(50, parseInt(v.pct) || 100)) }
+    return { mode: v.mode, pct: Math.min(300, Math.max(50, parseInt(v.pct) || 100)), origem: 'local' }
   }
-  return { mode: 'label', pct: 100 } // default novo: determinístico
+  return { mode: 'label', pct: 100, origem: 'default' } // default novo: determinístico
 }
 
 /**
@@ -303,75 +362,45 @@ function decidirEscalaAuto (filePath) {
   return cabeNoTamanho ? 'noscale' : 'fit'
 }
 
-// Tamanho-alvo da etiqueta térmica padrão: 100×150mm = 288×432pt
-const LABEL_W_PT = 288
-const LABEL_H_PT = 432
+// O tamanho-alvo, a reescrita do PDF e a junção de etiquetas moram em
+// `src/pdf-etiqueta.js` — puros, com teste (`src/pdf-etiqueta.test.js`).
+const { transformarPdf, normalizarEJuntar, juntarPdfs } = require('./src/pdf-etiqueta')
 
-/**
- * Reescreve o PDF via pdf-lib:
- *   mode 'label'  → cada página vira EXATAMENTE 288×432pt com o conteúdo
- *                   escalado proporcionalmente para preencher (sem distorcer).
- *   mode 'custom' → escala o conteúdo + página por pct/100.
- *
- * O resultado vai à impressora com `noscale`, então o que está no PDF é o que
- * sai no papel — driver e SumatraPDF não interferem mais na escala.
- */
-async function transformarPdf (buffer, mode, pct) {
-  const { PDFDocument } = require('pdf-lib')
-  const doc = await PDFDocument.load(buffer)
-
-  for (const page of doc.getPages()) {
-    const { width, height } = page.getSize()
-    if (mode === 'label') {
-      // Respeita orientação: se o PDF é paisagem, alvo vira 432×288
-      const isLandscape = width > height
-      const targetW = isLandscape ? LABEL_H_PT : LABEL_W_PT
-      const targetH = isLandscape ? LABEL_W_PT : LABEL_H_PT
-      // Escala proporcional pelo lado que limita (sem distorção)
-      const k = Math.min(targetW / width, targetH / height)
-      page.scale(k, k)
-      // Centraliza ajustando o MediaBox para o tamanho exato da etiqueta
-      const newW = width * k
-      const newH = height * k
-      const dx = (targetW - newW) / 2
-      const dy = (targetH - newH) / 2
-      page.translateContent(dx, dy)
-      page.setSize(targetW, targetH)
-    } else if (mode === 'custom') {
-      const k = pct / 100
-      page.scale(k, k)
-    }
-  }
-  return Buffer.from(await doc.save())
-}
-
-async function imprimirPdf (buffer, printerName) {
+async function imprimirPdf (buffers, printerName, escalaDoServidor) {
   const fs   = require('fs')
   const tmp  = require('os').tmpdir()
+  const lista = Array.isArray(buffers) ? buffers : [buffers]
 
-  const cfg = obterConfigEscala(printerName)
-  let bufferFinal = buffer
+  const cfg = obterConfigEscala(printerName, escalaDoServidor)
+  let bufferFinal = lista[0]
   let escalaSumatra = 'noscale'
 
   if (cfg.mode === 'label' || cfg.mode === 'custom') {
     // Pré-processa o PDF — escala determinística independente do driver.
     try {
-      bufferFinal = await transformarPdf(buffer, cfg.mode, cfg.pct)
+      bufferFinal = await normalizarEJuntar(lista, cfg.mode, cfg.pct)
       escalaSumatra = 'noscale'
-      console.log(`[print] ${printerName} mode=${cfg.mode}${cfg.mode === 'custom' ? ` pct=${cfg.pct}` : ''} → PDF reescrito + noscale`)
+      console.log(`[print] ${printerName} mode=${cfg.mode} (${cfg.origem})${cfg.mode === 'custom' ? ` pct=${cfg.pct}` : ''} → ${lista.length} PDF(s) reescrito(s) + noscale`)
     } catch (e) {
+      // ⚠️ RELANÇA quando é lote: `imprimirLote` refaz uma a uma e cada uma
+      // cai no seu próprio fallback. Engolir aqui imprimiria o lote inteiro
+      // com a escala errada.
+      if (lista.length > 1) throw e
       console.error(`[print] transformarPdf falhou (${e.message}) — fallback fit`)
-      bufferFinal = buffer
+      bufferFinal = lista[0]
       escalaSumatra = 'fit'
     }
   } else if (cfg.mode === 'auto') {
-    // Heurística legada — mantida por compat
+    // Heurística legada — mantida por compat. Decide pelo PRIMEIRO PDF: no
+    // lote todos vêm da mesma origem e do mesmo formato.
     const probe = path.join(tmp, `mhub_probe_${Date.now()}.pdf`)
-    fs.writeFileSync(probe, buffer)
+    fs.writeFileSync(probe, lista[0])
     escalaSumatra = decidirEscalaAuto(probe)
     try { fs.unlinkSync(probe) } catch (_) {}
+    if (lista.length > 1) bufferFinal = await juntarPdfs(lista)
   } else {
     escalaSumatra = cfg.mode // noscale | shrink | fit diretos
+    if (lista.length > 1) bufferFinal = await juntarPdfs(lista)
   }
 
   const file = path.join(tmp, `mhub_${Date.now()}.pdf`)

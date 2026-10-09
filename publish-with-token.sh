@@ -33,9 +33,20 @@ if [ "$NO_PUBLISH" -eq 0 ] && [ -z "$TOKEN_VALUE" ]; then
 fi
 
 # ─── Credenciais do banco (lidas do .env do backend; pulado em --no-publish) ──
-BACKEND_ENV=~/Sites/maximushub.com.br/backend/.env
-if [ "$NO_PUBLISH" -eq 0 ] && [ ! -f "$BACKEND_ENV" ]; then
-  echo "❌ Arquivo .env do backend não encontrado: $BACKEND_ENV"
+# ⚠️ O caminho mudou na virada para o NestJS (08/10/2026): o Adonis foi para
+# `arquivo/backend/` e a produção é o `backend-novo/`. O script apontava para
+# `~/Sites/maximushub.com.br/backend/.env`, que deixou de existir — e a falha
+# só apareceria no meio de uma publicação. Tenta os dois, na ordem do que é
+# produção hoje.
+BACKEND_ENV=""
+for candidato in \
+  ~/Sites/maximushub.com.br/backend-novo/.env \
+  ~/Sites/maximushub.com.br/arquivo/backend/.env \
+  ~/Sites/maximushub.com.br/backend/.env ; do
+  if [ -f "$candidato" ]; then BACKEND_ENV="$candidato"; break; fi
+done
+if [ "$NO_PUBLISH" -eq 0 ] && [ -z "$BACKEND_ENV" ]; then
+  echo "❌ Nenhum .env de backend encontrado (backend-novo, arquivo/backend)."
   exit 1
 fi
 

@@ -6,6 +6,7 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "test": "node src/fila-impressao.test.js && node src/pdf-etiqueta.test.js",
     "build:win": "electron-builder --win --x64",
     "build:mac": "electron-builder --mac",
     "packagePublish": "electron-builder --win --x64 --publish always"
