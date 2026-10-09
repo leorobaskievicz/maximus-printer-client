@@ -16,10 +16,28 @@
  * 7,8× mais rápido — 26 etiquetas entregues em 4,3 s — e a expedição não viu
  * diferença no papel: a impressora leva ~40 s para cuspir as mesmas 26.
  *
- * ⚠️ **Enviar a configuração evita mexer em máquina por máquina.** Era a
- * alternativa: trocar "Post-Print Action" para `None` no driver de cada
- * computador. Um comando no fio resolve para todas, inclusive as que forem
- * instaladas depois.
+ * ⚠️ **Enviar a configuração evita mexer em máquina por máquina.** Um SaaS
+ * não pode pedir que cada cliente configure a própria impressora — a
+ * alternativa manual ("Post-Print Action: None") foi procurada no driver da
+ * expedição e **nem existe lá**.
+ *
+ * ══════════════════════════════════════════════════════════════════════════
+ * ⚠️ A SEGUNDA CAUSA, DOCUMENTADA PELA ZEBRA (09/10/2026)
+ * ══════════════════════════════════════════════════════════════════════════
+ * Depois de o backfeed não explicar tudo, a busca na base da Zebra achou o
+ * sintoma descrito palavra por palavra: *"long delay before jobs print or
+ * between print jobs"* em impressora USB no Windows — e a causa é um
+ * **problema de temporização entre o tratamento USB do Windows e o Zebra
+ * Language Monitor** do pacote de driver. A correção que eles indicam é
+ * **desligar o suporte BIDIRECIONAL** da fila de impressão.
+ *
+ * Isso não é configuração da IMPRESSORA, é da fila do WINDOWS — e
+ * `Win32_Printer.EnableBIDI` é gravável por WMI. Dá para fazer daqui, sem
+ * ninguém abrir tela nenhuma, que é o que um SaaS precisa.
+ *
+ * ⚠️ O preço é real e está aceito: sem bidirecional o Windows deixa de ler
+ * status da impressora (sem papel, tampa aberta). O Hub nunca usou esse
+ * status — quem confirma impressão aqui é o ACK do próprio job.
  *
  * ══════════════════════════════════════════════════════════════════════════
  * ⚠️ AS TRÊS REGRAS QUE ESTE ARQUIVO SEGUE (e por que cada uma existe)
@@ -128,7 +146,13 @@ function comandosDePreparo({ velocidade = null, linguagem = 'zpl' } = {}) {
  * @param {(mensagem: string) => void} [registrar]
  * @param {() => number} [agora] injetável para o teste não depender do relógio
  */
-function criarPreparoDeImpressora({ enviarZpl, registrar = () => {}, agora = Date.now, intervaloMs = INTERVALO_MS }) {
+function criarPreparoDeImpressora({
+  enviarZpl,
+  desligarBidi = null,
+  registrar = () => {},
+  agora = Date.now,
+  intervaloMs = INTERVALO_MS,
+}) {
   /** nome da impressora → instante do último preparo bem-sucedido */
   const ultimoPreparo = new Map();
 
@@ -153,6 +177,21 @@ function criarPreparoDeImpressora({ enviarZpl, registrar = () => {}, agora = Dat
       registrar(
         `impressora ${nomeDaImpressora} preparada em ${linguagem.toUpperCase()} (backfeed desligado)`,
       );
+      /*
+       * ⚠️ DEPOIS do comando, e com erro isolado: desligar o bidirecional é a
+       * segunda causa (ver o cabeçalho), mas mexe na fila do Windows e pode
+       * exigir elevação. Falhar aqui não pode apagar o preparo que deu certo.
+       */
+      if (desligarBidi && opcoes.bidi !== false) {
+        try {
+          registrar(`${nomeDaImpressora}: ${await desligarBidi(nomeDaImpressora)}`);
+        } catch (erro) {
+          registrar(
+            `${nomeDaImpressora}: nao foi possivel desligar o bidirecional ` +
+              `(${erro && erro.message ? erro.message : erro})`,
+          );
+        }
+      }
       return 'preparada';
     } catch (erro) {
       // Não marca como preparada: a próxima impressão tenta de novo.
@@ -171,8 +210,30 @@ function criarPreparoDeImpressora({ enviarZpl, registrar = () => {}, agora = Dat
   return { preparar, esquecer };
 }
 
+/**
+ * O comando WMI que desliga o bidirecional de UMA fila de impressão.
+ *
+ * ⚠️ `Put()` grava na configuração do spooler — pode exigir elevação. Quando
+ * não houver, o erro vai para o log e a impressão segue: é otimização, não
+ * requisito.
+ *
+ * ⚠️ O nome da impressora entra com aspas simples DOBRADAS, não escapadas com
+ * barra: é WQL dentro de PowerShell, e `Zebra's` quebraria a consulta.
+ */
+function comandoDesligarBidi(nomeDaImpressora) {
+  const nome = String(nomeDaImpressora).replace(/'/g, "''");
+  return (
+    `$p = Get-WmiObject Win32_Printer -Filter "Name='${nome}'"; ` +
+    'if ($p -and $p.EnableBIDI) { $p.EnableBIDI = $false; $r = $p.Put(); ' +
+    "Write-Output 'bidi_desligado' } " +
+    "elseif ($p) { Write-Output 'bidi_ja_estava_desligado' } " +
+    "else { Write-Output 'impressora_nao_encontrada' }"
+  );
+}
+
 module.exports = {
   criarPreparoDeImpressora,
+  comandoDesligarBidi,
   comandosDePreparo,
   ehZebra,
   linguagemDaImpressora,

@@ -9,6 +9,7 @@
 const assert = require('assert');
 const {
   criarPreparoDeImpressora,
+  comandoDesligarBidi,
   comandosDePreparo,
   ehZebra,
   linguagemDaImpressora,
@@ -18,8 +19,9 @@ let passaram = 0;
 const casos = [];
 const teste = (nome, fn) => casos.push([nome, fn]);
 
-function montar({ falhar = false, agora = () => 1000, intervaloMs } = {}) {
+function montar({ falhar = false, bidiFalha = false, semBidi = false, agora = () => 1000, intervaloMs } = {}) {
   const enviados = [];
+  const bidis = [];
   const logs = [];
   const preparo = criarPreparoDeImpressora({
     agora,
@@ -28,9 +30,14 @@ function montar({ falhar = false, agora = () => 1000, intervaloMs } = {}) {
       if (falhar) throw new Error('impressora offline');
       enviados.push({ nome, texto });
     },
+    desligarBidi: semBidi ? null : async (nome) => {
+      if (bidiFalha) throw new Error('acesso negado');
+      bidis.push(nome);
+      return 'bidi_desligado';
+    },
     registrar: (m) => logs.push(m),
   });
-  return { preparo, enviados, logs };
+  return { preparo, enviados, bidis, logs };
 }
 
 // ── quem recebe ────────────────────────────────────────────────────────────
@@ -190,6 +197,52 @@ describe_bloco('falha', () => {
     const { preparo, enviados } = montar();
     assert.strictEqual(await preparo.preparar('Zebra ZD220', { ligado: false }), 'desligado');
     assert.deepStrictEqual(enviados, []);
+  });
+});
+
+// ── o bidirecional ─────────────────────────────────────────────────────────
+describe_bloco('desligar o bidirecional da fila do Windows', () => {
+  /**
+   * ⚠️ A segunda causa, e a documentada pela Zebra: "long delay before jobs
+   * print or between print jobs" em USB, por temporização entre o Windows e
+   * o Language Monitor do driver. A correção é da FILA, não da impressora —
+   * e por isso cabe a um SaaS aplicá-la sozinho.
+   */
+  teste('o preparo também desliga o bidirecional', async () => {
+    const { preparo, bidis } = montar();
+    await preparo.preparar('Zebra ZD220');
+    assert.deepStrictEqual(bidis, ['Zebra ZD220']);
+  });
+
+  teste('a consulta WQL dobra a aspa simples do nome', () => {
+    const cmd = comandoDesligarBidi("Zebra's ZD220");
+    assert.ok(cmd.includes("Name='Zebra''s ZD220'"));
+  });
+
+  teste('não mexe em quem já está desligado', () => {
+    assert.ok(comandoDesligarBidi('X').includes('bidi_ja_estava_desligado'));
+  });
+
+  /** Mexer na fila pode exigir elevação — e falhar nisso não pode apagar o
+   * preparo que deu certo nem impedir a impressão. */
+  teste('falha ao desligar o bidi NÃO derruba o preparo', async () => {
+    const { preparo, enviados, logs } = montar({ bidiFalha: true });
+    assert.strictEqual(await preparo.preparar('Zebra ZD220'), 'preparada');
+    assert.strictEqual(enviados.length, 1);
+    assert.ok(logs.join(' ').includes('nao foi possivel desligar o bidirecional'));
+  });
+
+  teste('`bidi: false` pula só essa parte', async () => {
+    const { preparo, enviados, bidis } = montar();
+    await preparo.preparar('Zebra ZD220', { bidi: false });
+    assert.strictEqual(enviados.length, 1);
+    assert.deepStrictEqual(bidis, []);
+  });
+
+  teste('sem a porta `desligarBidi`, o preparo funciona igual', async () => {
+    const { preparo, enviados } = montar({ semBidi: true });
+    assert.strictEqual(await preparo.preparar('Zebra ZD220'), 'preparada');
+    assert.strictEqual(enviados.length, 1);
   });
 });
 

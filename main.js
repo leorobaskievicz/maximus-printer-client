@@ -279,7 +279,7 @@ function registrar (mensagem) {
 }
 
 const { criarFilaDeImpressao } = require('./src/fila-impressao')
-const { criarPreparoDeImpressora } = require('./src/preparo-impressora')
+const { criarPreparoDeImpressora, comandoDesligarBidi } = require('./src/preparo-impressora')
 
 /**
  * O preparo da impressora — `src/preparo-impressora.js`.
@@ -291,6 +291,20 @@ const { criarPreparoDeImpressora } = require('./src/preparo-impressora')
  */
 const preparoDeImpressora = criarPreparoDeImpressora({
   enviarZpl: (nome, texto) => imprimirZpl(Buffer.from(texto, 'ascii'), null, null, nome),
+  /**
+   * Desliga o suporte BIDIRECIONAL da fila do Windows — a correção que a
+   * própria Zebra indica para "long delay between print jobs" em impressora
+   * USB. É configuração do SPOOLER, não da impressora, e por isso dá para
+   * aplicar daqui sem ninguém abrir tela.
+   */
+  desligarBidi: async (nome) => {
+    const { execSync } = require('child_process')
+    if (process.platform !== 'win32') return 'ignorado_fora_do_windows'
+    const ps = comandoDesligarBidi(nome).replace(/"/g, '\\"')
+    const saida = execSync(`powershell -NoProfile -ExecutionPolicy Bypass -Command "${ps}"`,
+      { timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'] })
+    return String(saida).trim() || 'sem_retorno'
+  },
   registrar: (m) => registrar(`[preparo] ${m}`),
 })
 
