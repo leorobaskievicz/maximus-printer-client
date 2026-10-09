@@ -107,6 +107,11 @@ function atualizarTray (status) {
   }
 
   items.push({ type: 'separator' })
+  // Para quem está na expedição conseguir mandar o log sem mexer em pasta.
+  items.push({
+    label: 'Abrir log de impressão',
+    click: () => shell.openPath(caminhoDoLog()),
+  })
   items.push({ label: `Sair (v${APP_VERSION})`, click: () => app.quit() })
 
   tray.setContextMenu(Menu.buildFromTemplate(items))
@@ -239,6 +244,40 @@ function reconectar () {
 // ⚠️ **Lote que falha é refeito UM A UM.** Um PDF corrompido no meio não pode
 // derrubar as outras 24 etiquetas: o erro vira ACK só para quem falhou.
 
+/**
+ * ⚠️ **O LOG EM ARQUIVO** (09/10/2026). Três versões seguidas tentaram tirar
+ * a pausa entre etiquetas e nenhuma pôde ser verificada: o `console.log` de
+ * um app de bandeja não vai a lugar nenhum, e a máquina está a 400 km. O
+ * diagnóstico virou palpite — e dois palpites erraram.
+ *
+ * Agora toda decisão de impressão fica em `print.log`, ao lado da
+ * configuração, e o menu da bandeja abre o arquivo. É o que permite
+ * responder "o comando chegou na impressora?" sem adivinhar.
+ *
+ * ⚠️ Rotação simples por tamanho: um log que cresce sem limite num
+ * computador de expedição vira um problema pior que o que ele resolve.
+ */
+const LIMITE_DO_LOG = 2 * 1024 * 1024
+
+function caminhoDoLog () {
+  return path.join(app.getPath('userData'), 'print.log')
+}
+
+function registrar (mensagem) {
+  const linha = `${new Date().toISOString()} ${mensagem}`
+  console.log(linha)
+  try {
+    const fs = require('fs')
+    const arquivo = caminhoDoLog()
+    try {
+      if (fs.statSync(arquivo).size > LIMITE_DO_LOG) {
+        fs.renameSync(arquivo, `${arquivo}.1`)
+      }
+    } catch (_) { /* ainda não existe */ }
+    fs.appendFileSync(arquivo, linha + '\n')
+  } catch (_) { /* log nunca pode derrubar impressão */ }
+}
+
 const { criarFilaDeImpressao } = require('./src/fila-impressao')
 const { criarPreparoDeImpressora } = require('./src/preparo-impressora')
 
@@ -252,7 +291,7 @@ const { criarPreparoDeImpressora } = require('./src/preparo-impressora')
  */
 const preparoDeImpressora = criarPreparoDeImpressora({
   enviarZpl: (nome, texto) => imprimirZpl(Buffer.from(texto, 'ascii'), null, null, nome),
-  registrar: (m) => console.log(`[print] ${m}`),
+  registrar: (m) => registrar(`[preparo] ${m}`),
 })
 
 /**
@@ -283,7 +322,7 @@ const filaDeImpressao = criarFilaDeImpressao({
       { qos: 1 }
     )
   },
-  registrar: (m) => console.log(`[print] ${m}`),
+  registrar: (m) => registrar(`[fila] ${m}`),
 })
 
 function enfileirar (job, userId) {
@@ -427,13 +466,13 @@ async function imprimirPdf (buffers, printerName, escalaDoServidor) {
     try {
       bufferFinal = await normalizarEJuntar(lista, cfg.mode, cfg.pct)
       escalaSumatra = 'noscale'
-      console.log(`[print] ${printerName} mode=${cfg.mode} (${cfg.origem})${cfg.mode === 'custom' ? ` pct=${cfg.pct}` : ''} → ${lista.length} PDF(s) reescrito(s) + noscale`)
+      registrar(`[pdf] ${printerName} mode=${cfg.mode} (${cfg.origem})${cfg.mode === 'custom' ? ` pct=${cfg.pct}` : ''} → ${lista.length} PDF(s) reescrito(s) + noscale`)
     } catch (e) {
       // ⚠️ RELANÇA quando é lote: `imprimirLote` refaz uma a uma e cada uma
       // cai no seu próprio fallback. Engolir aqui imprimiria o lote inteiro
       // com a escala errada.
       if (lista.length > 1) throw e
-      console.error(`[print] transformarPdf falhou (${e.message}) — fallback fit`)
+      registrar(`[pdf] transformarPdf falhou (${e.message}) — fallback fit`)
       bufferFinal = lista[0]
       escalaSumatra = 'fit'
     }
@@ -453,9 +492,17 @@ async function imprimirPdf (buffers, printerName, escalaDoServidor) {
   const file = path.join(tmp, `mhub_${Date.now()}.pdf`)
   fs.writeFileSync(file, bufferFinal)
 
+  const comecou = Date.now()
   try {
     if (pdfPrint) {
       await pdfPrint.print(file, { printer: printerName, silent: true, scale: escalaSumatra })
+      /*
+       * ⚠️ Este número é o que separa "o software está lento" de "a
+       * impressora está lenta". Ele mede até o SPOOLER aceitar — o papel sai
+       * depois, no ritmo do equipamento. Sem ele, as duas coisas viram a
+       * mesma queixa.
+       */
+      registrar(`[pdf] ${printerName}: ${lista.length} documento(s) entregues ao spooler em ${Date.now() - comecou} ms (escala ${escalaSumatra})`)
     } else {
       // Fallback macOS/Linux via CUPS (lp)
       const { execSync } = require('child_process')
@@ -518,21 +565,47 @@ async function imprimirZpl (buffer, zplHost, zplPort, printerName) {
       setTimeout(() => { socket.destroy(); reject(new Error('Timeout TCP ZPL')) }, 10000)
     })
   } else {
-    // Driver Windows: PowerShell RawPrint
+    // Driver Windows: envio RAW pelo spooler (winspool).
+    //
+    // ══════════════════════════════════════════════════════════════════════
+    // ⚠️ ESTE CAMINHO ESTAVA QUEBRADO, E EM SILÊNCIO (09/10/2026)
+    // ══════════════════════════════════════════════════════════════════════
+    // A versão anterior declarava `StartDocPrinter(IntPtr, int, int[])` e
+    // passava `New-Object int[] 3` como DOC_INFO_1. A estrutura são TRÊS
+    // PONTEIROS — 24 bytes em x64 — e o array tem 12: o spooler lia 12 bytes
+    // de lixo além do buffer. Pior, `$di[0]=1` punha o valor 1 em `pDocName`,
+    // que é um ponteiro: endereço inválido.
+    //
+    // E **nada conferia retorno** (`|Out-Null` em tudo). Quando
+    // `StartDocPrinter` falhava, o `WritePrinter` seguia e não escrevia nada
+    // — o comando simplesmente não chegava à impressora, sem erro nenhum.
+    //
+    // Foi o que aconteceu com o preparo das versões 1.0.5 e 1.0.6: o `~JSO`
+    // e o `JB` eram montados certos e provavelmente nunca saíram daqui. Como
+    // ninguém imprimia ZPL por driver em produção (100% dos jobs são PDF via
+    // SumatraPDF), o defeito nunca tinha aparecido.
+    //
+    // ⚠️ **`pDatatype = "RAW"` é obrigatório.** Sem ele o spooler usa o
+    // padrão do driver, que para o ZDesigner pode ser o formato gráfico — e
+    // aí os bytes do comando seriam IMPRESSOS como texto numa etiqueta, em
+    // vez de interpretados.
     const { execSync } = require('child_process')
     const fs   = require('fs')
-    const file = path.join(os.tmpdir(), `mhub_${Date.now()}.zpl`)
+    const file = path.join(os.tmpdir(), `mhub_${Date.now()}.bin`)
     fs.writeFileSync(file, buffer)
     const ps = `
+      $ErrorActionPreference='Stop'
       Add-Type -TypeDefinition @"
       using System;using System.Runtime.InteropServices;using System.IO;
+      [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+      public struct DOCINFO { public string pDocName; public string pOutputFile; public string pDatatype; }
       public class RawPrint {
-        [DllImport("winspool.drv",EntryPoint="OpenPrinterA",SetLastError=true)]
-        public static extern bool OpenPrinter(string printerName,ref IntPtr hPrinter,IntPtr pd);
+        [DllImport("winspool.drv",EntryPoint="OpenPrinterW",SetLastError=true,CharSet=CharSet.Unicode)]
+        public static extern bool OpenPrinter(string printerName,out IntPtr hPrinter,IntPtr pd);
         [DllImport("winspool.drv",EntryPoint="ClosePrinter",SetLastError=true)]
         public static extern bool ClosePrinter(IntPtr hPrinter);
-        [DllImport("winspool.drv",EntryPoint="StartDocPrinterA",SetLastError=true)]
-        public static extern int StartDocPrinter(IntPtr hPrinter,int level,int[] di);
+        [DllImport("winspool.drv",EntryPoint="StartDocPrinterW",SetLastError=true,CharSet=CharSet.Unicode)]
+        public static extern int StartDocPrinter(IntPtr hPrinter,int level,ref DOCINFO di);
         [DllImport("winspool.drv",EntryPoint="EndDocPrinter",SetLastError=true)]
         public static extern bool EndDocPrinter(IntPtr hPrinter);
         [DllImport("winspool.drv",EntryPoint="StartPagePrinter",SetLastError=true)]
@@ -540,21 +613,40 @@ async function imprimirZpl (buffer, zplHost, zplPort, printerName) {
         [DllImport("winspool.drv",EntryPoint="EndPagePrinter",SetLastError=true)]
         public static extern bool EndPagePrinter(IntPtr hPrinter);
         [DllImport("winspool.drv",EntryPoint="WritePrinter",SetLastError=true)]
-        public static extern bool WritePrinter(IntPtr hPrinter,byte[] pBytes,int dwCount,ref int dwWritten);
+        public static extern bool WritePrinter(IntPtr hPrinter,byte[] pBytes,int dwCount,out int dwWritten);
+        public static void Enviar(string impressora,string arquivo){
+          IntPtr h; 
+          if(!OpenPrinter(impressora, out h, IntPtr.Zero))
+            throw new Exception("OpenPrinter falhou: "+Marshal.GetLastWin32Error());
+          try{
+            DOCINFO di=new DOCINFO();
+            di.pDocName="MaximusHub RAW"; di.pDatatype="RAW";
+            if(StartDocPrinter(h,1,ref di)==0)
+              throw new Exception("StartDocPrinter falhou: "+Marshal.GetLastWin32Error());
+            try{
+              if(!StartPagePrinter(h))
+                throw new Exception("StartPagePrinter falhou: "+Marshal.GetLastWin32Error());
+              byte[] b=File.ReadAllBytes(arquivo); int escritos=0;
+              if(!WritePrinter(h,b,b.Length,out escritos))
+                throw new Exception("WritePrinter falhou: "+Marshal.GetLastWin32Error());
+              if(escritos!=b.Length)
+                throw new Exception("WritePrinter escreveu "+escritos+" de "+b.Length+" bytes");
+              EndPagePrinter(h);
+            } finally { EndDocPrinter(h); }
+          } finally { ClosePrinter(h); }
+        }
       }
 "@
-      $hPrinter=[IntPtr]::Zero
-      [RawPrint]::OpenPrinter("${printerName}",[ref]$hPrinter,[IntPtr]::Zero)|Out-Null
-      $di=New-Object int[] 3;$di[0]=1;[RawPrint]::StartDocPrinter($hPrinter,1,$di)|Out-Null
-      [RawPrint]::StartPagePrinter($hPrinter)|Out-Null
-      $bytes=[IO.File]::ReadAllBytes("${file}")
-      $written=0;[RawPrint]::WritePrinter($hPrinter,$bytes,$bytes.Length,[ref]$written)|Out-Null
-      [RawPrint]::EndPagePrinter($hPrinter)|Out-Null
-      [RawPrint]::EndDocPrinter($hPrinter)|Out-Null
-      [RawPrint]::ClosePrinter($hPrinter)|Out-Null
+      [RawPrint]::Enviar('${printerName.replace(/'/g, "''")}','${file.replace(/'/g, "''")}')
     `.replace(/\n\s+/g, ' ')
     try {
-      execSync(`powershell -NoProfile -Command "${ps}"`, { timeout: 15000 })
+      // ⚠️ `stdio: pipe` para a mensagem de erro do PowerShell chegar aqui: a
+      // versão anterior engolia qualquer falha junto com o `Out-Null`.
+      execSync(`powershell -NoProfile -ExecutionPolicy Bypass -Command "${ps.replace(/"/g, '\\"')}"`,
+        { timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (e) {
+      const detalhe = (e.stderr && e.stderr.toString().trim()) || e.message
+      throw new Error(`Envio RAW para "${printerName}" falhou: ${detalhe.slice(0, 300)}`)
     } finally {
       try { require('fs').unlinkSync(file) } catch (_) {}
     }
