@@ -102,6 +102,42 @@ describe_bloco('ZPL ou EPL — o driver diz qual', () => {
     assert.deepStrictEqual(enviados.map((e) => e.texto), ['JB\n', '~JSO\n']);
   });
 
+  /**
+   * ⚠️ Desde a conversão PDF→ZPL no servidor (09/10/2026), a MESMA impressora
+   * recebe ZPL cru mesmo com o driver EPL instalado: a Zebra troca de modo ao
+   * ver o `^XA`. Nesse caso quem vale é o `~JSO`, e o nome do driver passa a
+   * ser só o palpite do caminho em PDF.
+   */
+  teste('a linguagem do JOB vence o nome do driver', async () => {
+    const { preparo, enviados } = montar();
+    await preparo.preparar('ZDesigner GC420t (EPL) (Copiar 1)', { linguagem: 'zpl' });
+    assert.deepStrictEqual(enviados.map((e) => e.texto), ['~JSO\n']);
+  });
+
+  /**
+   * ⚠️ Em modo ZPL o `JB` é ignorado, e em modo EPL o `~JSO` também. Com a
+   * memória guardada só pelo nome, o segundo modo ficaria uma hora inteira
+   * sem preparo nenhum — e a pausa voltaria só nele.
+   */
+  teste('a mesma impressora é preparada nas DUAS linguagens', async () => {
+    const { preparo, enviados } = montar();
+    assert.strictEqual(await preparo.preparar('Zebra ZD220', { linguagem: 'zpl' }), 'preparada');
+    assert.strictEqual(await preparo.preparar('Zebra ZD220', { linguagem: 'epl' }), 'preparada');
+    assert.deepStrictEqual(enviados.map((e) => e.texto), ['~JSO\n', 'JB\n']);
+    // mas não repete a mesma linguagem dentro do intervalo
+    assert.strictEqual(await preparo.preparar('Zebra ZD220', { linguagem: 'zpl' }), 'recente');
+  });
+
+  /** A linguagem do job não pode fazer uma laser comum receber `~JSO`. */
+  teste('`linguagem` do job NÃO contorna a lista de aceite', async () => {
+    const { preparo, enviados } = montar();
+    assert.strictEqual(
+      await preparo.preparar('HP LaserJet 1020', { linguagem: 'zpl' }),
+      'nao_e_zebra',
+    );
+    assert.deepStrictEqual(enviados, []);
+  });
+
   teste('a velocidade em EPL é `S<n>`', () => {
     assert.strictEqual(comandosDePreparo({ linguagem: 'epl', velocidade: 4 }), 'JB\nS4\n');
   });

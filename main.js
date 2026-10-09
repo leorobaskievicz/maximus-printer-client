@@ -279,6 +279,7 @@ function registrar (mensagem) {
 }
 
 const { criarFilaDeImpressao } = require('./src/fila-impressao')
+const { scriptPowerShell, comandoPowerShell } = require('./src/envio-raw-windows')
 const { criarPreparoDeImpressora, comandoDesligarBidi } = require('./src/preparo-impressora')
 
 /**
@@ -319,7 +320,14 @@ const filaDeImpressao = criarFilaDeImpressao({
     // ⚠️ Antes do lote: desliga o backfeed na Zebra, que é o "recalibrar"
     // entre uma etiqueta e outra. Só vale para impressora que fala ZPL e por
     // isso a detecção é pelo nome — ver `preparo-impressora.js`.
-    await preparoDeImpressora.preparar(job.printer_system_name, obterPreparo(job.printer_system_name))
+    //
+    // ⚠️ `linguagem` vem do JOB: num lote ZPL a impressora já trocou de modo
+    // ao ver o `^XA`, e o comando certo é o `~JSO`, mesmo que o driver
+    // instalado no Windows seja o EPL.
+    await preparoDeImpressora.preparar(job.printer_system_name, {
+      ...obterPreparo(job.printer_system_name),
+      ...(job.type === 'zpl' ? { linguagem: 'zpl' } : {})
+    })
     if (job.type === 'zpl') {
       // ⚠️ ZPL é um fluxo de comandos (`^XA`…`^XZ` por etiqueta): concatenar
       // é o formato nativo de mandar várias. Um socket, não N.
@@ -599,70 +607,50 @@ async function imprimirZpl (buffer, zplHost, zplPort, printerName) {
     // ninguém imprimia ZPL por driver em produção (100% dos jobs são PDF via
     // SumatraPDF), o defeito nunca tinha aparecido.
     //
+    // ⚠️ **E a 1.0.7/1.0.8 AINDA não funcionavam, por um terceiro motivo**
+    // (provado pelo log da expedição em 09/10/2026):
+    //
+    //     $ErrorActionPreference='Stop' Add-Type -TypeDefinition @" ...
+    //                                   ~~~~~~~~
+    //     Token 'Add-Type' inesperado na expressao ou instrucao.
+    //     No linha:1 caractere:32
+    //
+    // "linha 1" entrega o diagnóstico: um `.replace(/\n\s+/g, ' ')` colapsava
+    // o script INTEIRO numa linha só para caber em `-Command`. Isso quebra
+    // duas coisas de uma vez — os comandos ficam sem `;` entre eles, e o
+    // **here-string** `@"…"@` do PowerShell EXIGE quebra de linha depois do
+    // `@"` e o `"@` no começo da linha. Nenhuma quantidade de escape de aspas
+    // conserta isso.
+    //
+    // ⚠️ Por isso o script vai num **arquivo `.ps1`** e os dados vão como
+    // ARGUMENTO (`param(...)`), nunca interpolados no código: nome de
+    // impressora com aspas deixa de ser um problema de escape.
+    //
     // ⚠️ **`pDatatype = "RAW"` é obrigatório.** Sem ele o spooler usa o
     // padrão do driver, que para o ZDesigner pode ser o formato gráfico — e
     // aí os bytes do comando seriam IMPRESSOS como texto numa etiqueta, em
     // vez de interpretados.
     const { execSync } = require('child_process')
     const fs   = require('fs')
-    const file = path.join(os.tmpdir(), `mhub_${Date.now()}.bin`)
+    const base = path.join(os.tmpdir(), `mhub_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`)
+    const file = `${base}.bin`
+    const script = `${base}.ps1`
     fs.writeFileSync(file, buffer)
-    const ps = `
-      $ErrorActionPreference='Stop'
-      Add-Type -TypeDefinition @"
-      using System;using System.Runtime.InteropServices;using System.IO;
-      [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
-      public struct DOCINFO { public string pDocName; public string pOutputFile; public string pDatatype; }
-      public class RawPrint {
-        [DllImport("winspool.drv",EntryPoint="OpenPrinterW",SetLastError=true,CharSet=CharSet.Unicode)]
-        public static extern bool OpenPrinter(string printerName,out IntPtr hPrinter,IntPtr pd);
-        [DllImport("winspool.drv",EntryPoint="ClosePrinter",SetLastError=true)]
-        public static extern bool ClosePrinter(IntPtr hPrinter);
-        [DllImport("winspool.drv",EntryPoint="StartDocPrinterW",SetLastError=true,CharSet=CharSet.Unicode)]
-        public static extern int StartDocPrinter(IntPtr hPrinter,int level,ref DOCINFO di);
-        [DllImport("winspool.drv",EntryPoint="EndDocPrinter",SetLastError=true)]
-        public static extern bool EndDocPrinter(IntPtr hPrinter);
-        [DllImport("winspool.drv",EntryPoint="StartPagePrinter",SetLastError=true)]
-        public static extern bool StartPagePrinter(IntPtr hPrinter);
-        [DllImport("winspool.drv",EntryPoint="EndPagePrinter",SetLastError=true)]
-        public static extern bool EndPagePrinter(IntPtr hPrinter);
-        [DllImport("winspool.drv",EntryPoint="WritePrinter",SetLastError=true)]
-        public static extern bool WritePrinter(IntPtr hPrinter,byte[] pBytes,int dwCount,out int dwWritten);
-        public static void Enviar(string impressora,string arquivo){
-          IntPtr h; 
-          if(!OpenPrinter(impressora, out h, IntPtr.Zero))
-            throw new Exception("OpenPrinter falhou: "+Marshal.GetLastWin32Error());
-          try{
-            DOCINFO di=new DOCINFO();
-            di.pDocName="MaximusHub RAW"; di.pDatatype="RAW";
-            if(StartDocPrinter(h,1,ref di)==0)
-              throw new Exception("StartDocPrinter falhou: "+Marshal.GetLastWin32Error());
-            try{
-              if(!StartPagePrinter(h))
-                throw new Exception("StartPagePrinter falhou: "+Marshal.GetLastWin32Error());
-              byte[] b=File.ReadAllBytes(arquivo); int escritos=0;
-              if(!WritePrinter(h,b,b.Length,out escritos))
-                throw new Exception("WritePrinter falhou: "+Marshal.GetLastWin32Error());
-              if(escritos!=b.Length)
-                throw new Exception("WritePrinter escreveu "+escritos+" de "+b.Length+" bytes");
-              EndPagePrinter(h);
-            } finally { EndDocPrinter(h); }
-          } finally { ClosePrinter(h); }
-        }
-      }
-"@
-      [RawPrint]::Enviar('${printerName.replace(/'/g, "''")}','${file.replace(/'/g, "''")}')
-    `.replace(/\n\s+/g, ' ')
+    const ps = scriptPowerShell()
+    fs.writeFileSync(script, ps, 'ascii')
     try {
       // ⚠️ `stdio: pipe` para a mensagem de erro do PowerShell chegar aqui: a
       // versão anterior engolia qualquer falha junto com o `Out-Null`.
-      execSync(`powershell -NoProfile -ExecutionPolicy Bypass -Command "${ps.replace(/"/g, '\\"')}"`,
-        { timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'] })
+      execSync(comandoPowerShell(script, printerName, file), {
+        timeout: 15000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
     } catch (e) {
       const detalhe = (e.stderr && e.stderr.toString().trim()) || e.message
       throw new Error(`Envio RAW para "${printerName}" falhou: ${detalhe.slice(0, 300)}`)
     } finally {
-      try { require('fs').unlinkSync(file) } catch (_) {}
+      try { fs.unlinkSync(file) } catch (_) {}
+      try { fs.unlinkSync(script) } catch (_) {}
     }
   }
 }

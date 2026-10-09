@@ -153,7 +153,7 @@ function criarPreparoDeImpressora({
   agora = Date.now,
   intervaloMs = INTERVALO_MS,
 }) {
-  /** nome da impressora → instante do último preparo bem-sucedido */
+  /** `nome\0linguagem` → instante do último preparo bem-sucedido */
   const ultimoPreparo = new Map();
 
   /**
@@ -165,15 +165,31 @@ function criarPreparoDeImpressora({
    */
   async function preparar(nomeDaImpressora, opcoes = {}) {
     if (opcoes.ligado === false) return 'desligado';
-    const linguagem = linguagemDaImpressora(nomeDaImpressora);
-    if (!linguagem) return 'nao_e_zebra';
+    /*
+     * ⚠️ **Quem manda é o JOB, não o nome do driver** (09/10/2026). Desde a
+     * conversão PDF→ZPL no servidor, a etiqueta pode chegar como ZPL cru para
+     * a MESMA impressora cujo driver é EPL — e a Zebra troca de linguagem
+     * sozinha ao ver o `^XA` ("automatic printer language detection and
+     * switching", manual da GC420t). Nesse caso ela está em ZPL e quem vale é
+     * o `~JSO`; o nome do driver passa a ser só o palpite de quando o job vem
+     * em PDF, que é o caminho que de fato passa pelo driver.
+     */
+    const linguagem = opcoes.linguagem || linguagemDaImpressora(nomeDaImpressora);
+    if (!linguagem || !ehZebra(nomeDaImpressora)) return 'nao_e_zebra';
 
-    const ultimo = ultimoPreparo.get(nomeDaImpressora);
+    /*
+     * ⚠️ A memória é por (impressora, LINGUAGEM). A mesma máquina recebendo um
+     * lote em ZPL e outro em PDF precisa dos dois comandos: em modo ZPL o `JB`
+     * é ignorado, e em modo EPL o `~JSO` também. Com a chave só no nome, o
+     * segundo modo ficaria uma hora sem preparo nenhum.
+     */
+    const chave = `${nomeDaImpressora}\u0000${linguagem}`;
+    const ultimo = ultimoPreparo.get(chave);
     if (ultimo && agora() - ultimo < intervaloMs) return 'recente';
 
     try {
       await enviarZpl(nomeDaImpressora, comandosDePreparo({ ...opcoes, linguagem }));
-      ultimoPreparo.set(nomeDaImpressora, agora());
+      ultimoPreparo.set(chave, agora());
       registrar(
         `impressora ${nomeDaImpressora} preparada em ${linguagem.toUpperCase()} (backfeed desligado)`,
       );
