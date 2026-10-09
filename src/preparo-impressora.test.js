@@ -11,6 +11,7 @@ const {
   criarPreparoDeImpressora,
   comandosDePreparo,
   ehZebra,
+  linguagemDaImpressora,
 } = require('./preparo-impressora');
 
 let passaram = 0;
@@ -64,6 +65,38 @@ describe_bloco('a detecção é lista de ACEITE', () => {
     const { preparo, enviados } = montar();
     assert.strictEqual(await preparo.preparar('HP LaserJet 1020'), 'nao_e_zebra');
     assert.deepStrictEqual(enviados, []);
+  });
+});
+
+// ── a linguagem ────────────────────────────────────────────────────────────
+describe_bloco('ZPL ou EPL — o driver diz qual', () => {
+  /**
+   * ⚠️ O caso que a 1.0.5 errou. A impressora da expedição é a
+   * `ZDesigner GC420t (EPL) (Copiar 1)`: o `~JSO` (ZPL) foi enviado, a
+   * impressora ignorou, e a pausa continuou. Supor a linguagem pelo
+   * fabricante não funciona — o sufixo do driver é quem sabe.
+   */
+  teste('o sufixo (EPL) no nome decide a linguagem', () => {
+    assert.strictEqual(linguagemDaImpressora('ZDesigner GC420t (EPL) (Copiar 1)'), 'epl');
+    assert.strictEqual(linguagemDaImpressora('ZDesigner GC420t (Copiar 1)'), 'zpl');
+    assert.strictEqual(linguagemDaImpressora('Zebra ZD220'), 'zpl');
+    assert.strictEqual(linguagemDaImpressora('Microsoft Print to PDF'), null);
+  });
+
+  teste('em EPL o comando é `JB`, não `~JSO`', () => {
+    assert.strictEqual(comandosDePreparo({ linguagem: 'epl' }), 'JB\n');
+    assert.ok(!comandosDePreparo({ linguagem: 'epl' }).includes('~JSO'));
+  });
+
+  teste('a impressora recebe o comando da SUA linguagem', async () => {
+    const { preparo, enviados } = montar();
+    await preparo.preparar('ZDesigner GC420t (EPL) (Copiar 1)');
+    await preparo.preparar('ZDesigner GC420t (Copiar 1)');
+    assert.deepStrictEqual(enviados.map((e) => e.texto), ['JB\n', '~JSO\n']);
+  });
+
+  teste('a velocidade em EPL é `S<n>`', () => {
+    assert.strictEqual(comandosDePreparo({ linguagem: 'epl', velocidade: 4 }), 'JB\nS4\n');
   });
 });
 

@@ -25,9 +25,16 @@
  * ⚠️ AS TRÊS REGRAS QUE ESTE ARQUIVO SEGUE (e por que cada uma existe)
  * ══════════════════════════════════════════════════════════════════════════
  *
- * **1. Só para impressora que fala ZPL.** Mandar `~JSO` para uma laser comum
- * IMPRIME O TEXTO "~JSO" numa folha. A detecção é pelo nome e é
- * deliberadamente conservadora: na dúvida, não manda.
+ * **1. Só para impressora térmica, e na LINGUAGEM certa.** Mandar `~JSO` para
+ * uma laser comum IMPRIME O TEXTO "~JSO" numa folha. A detecção é pelo nome e
+ * é deliberadamente conservadora: na dúvida, não manda.
+ *
+ * ⚠️ **E a linguagem importa tanto quanto o modelo** (09/10/2026). A 1.0.5
+ * mandou `~JSO` e a pausa continuou: a impressora da expedição é a
+ * `ZDesigner GC420t (EPL) (Copiar 1)` — driver em **EPL**, onde `~JSO`
+ * simplesmente não existe e é ignorado. Em EPL o comando equivalente é `JB`
+ * (*Disable Top Of Form Backup*). Supor a linguagem pelo fabricante foi o
+ * erro; o nome do driver diz qual é, e agora ele decide.
  *
  * **2. Nada que faça a impressora andar.** Os comandos `~` (control) são
  * processados na hora e não produzem papel. Ficaram DE FORA, de propósito:
@@ -60,15 +67,35 @@ const INTERVALO_MS = 60 * 60 * 1000;
  */
 const NOME_DE_ZEBRA = /zebra|zdesigner|\bzd[24]\d{2}\b|\bg[ckx]4\d{2}\b|\bzt[24]\d{2}\b|\bzp\s?5\d{2}\b|\bzq\d{3}\b/i;
 
+/** O driver anuncia a linguagem no próprio nome: "ZDesigner GC420t (EPL)". */
+const NOME_DE_EPL = /\bepl\b/i;
+
 function ehZebra(nomeDaImpressora) {
   return NOME_DE_ZEBRA.test(String(nomeDaImpressora || ''));
 }
 
 /**
+ * `'epl'` | `'zpl'` | `null` — a linguagem que esta impressora entende.
+ *
+ * ⚠️ O sufixo `(EPL)` no nome do driver é a única pista confiável que temos
+ * sem conversar com o equipamento. Errar aqui é mandar um comando que a
+ * impressora ignora (o caso da 1.0.5) — ou, pior, que ela imprime.
+ */
+function linguagemDaImpressora(nomeDaImpressora) {
+  const nome = String(nomeDaImpressora || '');
+  if (!ehZebra(nome)) return null;
+  return NOME_DE_EPL.test(nome) ? 'epl' : 'zpl';
+}
+
+/**
  * Os comandos, na ordem.
  *
- * `~JSO` — **Backfeed Sequence: Off.** É o que resolve o sintoma relatado.
- * Control command: a impressora processa na hora, sem imprimir nem avançar.
+ * **ZPL** — `~JSO` (*Backfeed Sequence: Off*). Control command: a impressora
+ * processa na hora, sem imprimir nem avançar.
+ *
+ * **EPL** — `JB` (*Disable Top Of Form Backup*). Mesmo efeito, outra
+ * linguagem. É o que a impressora da expedição entende, e o que faltava na
+ * 1.0.5.
  *
  * `^XA^MMT^PR{v}^XZ` — formato de configuração, OPCIONAL (ver `velocidade`):
  *   - `^MMT` garante o modo Tear-Off (se a impressora estiver em Peel ou
@@ -81,7 +108,14 @@ function ehZebra(nomeDaImpressora) {
  * depende do firmware, e uma etiqueta em branco por lote é desperdício
  * visível. O `~JSO`, que é o que importa, não tem essa dúvida.
  */
-function comandosDePreparo({ velocidade = null } = {}) {
+function comandosDePreparo({ velocidade = null, linguagem = 'zpl' } = {}) {
+  if (linguagem === 'epl') {
+    const partes = ['JB'];
+    // `S<n>` é a velocidade em EPL. Desligada por padrão, pela mesma razão do
+    // `^PR`: mexer em parâmetro de impressão sem ver o papel.
+    if (velocidade) partes.push(`S${velocidade}`);
+    return partes.join('\n') + '\n';
+  }
   const partes = ['~JSO'];
   if (velocidade) partes.push(`^XA^MMT^PR${velocidade}^XZ`);
   return partes.join('\n') + '\n';
@@ -107,15 +141,18 @@ function criarPreparoDeImpressora({ enviarZpl, registrar = () => {}, agora = Dat
    */
   async function preparar(nomeDaImpressora, opcoes = {}) {
     if (opcoes.ligado === false) return 'desligado';
-    if (!nomeDaImpressora || !ehZebra(nomeDaImpressora)) return 'nao_e_zebra';
+    const linguagem = linguagemDaImpressora(nomeDaImpressora);
+    if (!linguagem) return 'nao_e_zebra';
 
     const ultimo = ultimoPreparo.get(nomeDaImpressora);
     if (ultimo && agora() - ultimo < intervaloMs) return 'recente';
 
     try {
-      await enviarZpl(nomeDaImpressora, comandosDePreparo(opcoes));
+      await enviarZpl(nomeDaImpressora, comandosDePreparo({ ...opcoes, linguagem }));
       ultimoPreparo.set(nomeDaImpressora, agora());
-      registrar(`impressora ${nomeDaImpressora} preparada (backfeed desligado)`);
+      registrar(
+        `impressora ${nomeDaImpressora} preparada em ${linguagem.toUpperCase()} (backfeed desligado)`,
+      );
       return 'preparada';
     } catch (erro) {
       // Não marca como preparada: a próxima impressão tenta de novo.
@@ -138,6 +175,7 @@ module.exports = {
   criarPreparoDeImpressora,
   comandosDePreparo,
   ehZebra,
+  linguagemDaImpressora,
   NOME_DE_ZEBRA,
   INTERVALO_MS,
 };
