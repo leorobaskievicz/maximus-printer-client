@@ -240,6 +240,20 @@ function reconectar () {
 // derrubar as outras 24 etiquetas: o erro vira ACK só para quem falhou.
 
 const { criarFilaDeImpressao } = require('./src/fila-impressao')
+const { criarPreparoDeImpressora } = require('./src/preparo-impressora')
+
+/**
+ * O preparo da impressora — `src/preparo-impressora.js`.
+ *
+ * ⚠️ Roda ANTES do lote, não antes de cada etiqueta: `~JSO` é configuração
+ * PERSISTENTE na impressora, e repetir só enfileira trabalho no spooler.
+ * Nunca lança: preparo é otimização, e uma falha aqui não pode impedir a
+ * etiqueta de sair.
+ */
+const preparoDeImpressora = criarPreparoDeImpressora({
+  enviarZpl: (nome, texto) => imprimirZpl(Buffer.from(texto, 'ascii'), null, null, nome),
+  registrar: (m) => console.log(`[print] ${m}`),
+})
 
 /**
  * A fila — a regra mora em `src/fila-impressao.js` (pura, com teste). Aqui
@@ -249,6 +263,10 @@ const filaDeImpressao = criarFilaDeImpressao({
   imprimir: async (lote) => {
     const { job } = lote[0]
     const buffers = lote.map((i) => Buffer.from(i.job.data, 'base64'))
+    // ⚠️ Antes do lote: desliga o backfeed na Zebra, que é o "recalibrar"
+    // entre uma etiqueta e outra. Só vale para impressora que fala ZPL e por
+    // isso a detecção é pelo nome — ver `preparo-impressora.js`.
+    await preparoDeImpressora.preparar(job.printer_system_name, obterPreparo(job.printer_system_name))
     if (job.type === 'zpl') {
       // ⚠️ ZPL é um fluxo de comandos (`^XA`…`^XZ` por etiqueta): concatenar
       // é o formato nativo de mandar várias. Um socket, não N.
@@ -311,6 +329,35 @@ function obterConfigEscala (printerName, escalaDoServidor) {
     return { mode: v.mode, pct: Math.min(300, Math.max(50, parseInt(v.pct) || 100)), origem: 'local' }
   }
   return { mode: 'label', pct: 100, origem: 'default' } // default novo: determinístico
+}
+
+/**
+ * A configuração do preparo, por impressora (local, como a da escala).
+ *
+ * ⚠️ **Ligado por padrão, e desligável sem release.** O backfeed é o sintoma
+ * que a expedição relatou; desligá-lo é o conserto. Mas é a única coisa que o
+ * Print Client escreve na CONFIGURAÇÃO de um equipamento, então precisa de
+ * freio de mão sem depender de atualização.
+ *
+ * ⚠️ `velocidade` nasce NULA de propósito. `^PR` exige um `^XA…^XZ`, e um
+ * formato sem campo imprimível **não deveria** produzir etiqueta — mas isso
+ * depende do firmware, e uma etiqueta em branco por lote é desperdício
+ * visível. Quem quiser testar liga numa máquina e confere o papel; o `~JSO`,
+ * que é o que resolve, não tem essa dúvida e por isso vai sempre.
+ */
+function obterPreparo (printerName) {
+  const map = store.get('zpl_prep_by_printer') || {}
+  const v = map[printerName]
+  if (v && typeof v === 'object') {
+    return {
+      ligado: v.ligado !== false,
+      velocidade: Number.isFinite(Number(v.velocidade)) && Number(v.velocidade) > 0
+        ? Math.min(14, Math.max(1, parseInt(v.velocidade, 10)))
+        : null,
+    }
+  }
+  if (v === false) return { ligado: false }
+  return { ligado: true, velocidade: null }
 }
 
 /**

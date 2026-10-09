@@ -1,12 +1,12 @@
 {
   "name": "maximushub-print-client",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "MaximusHub Print Client — impressão local via MQTT",
   "author": "MaximusHub",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "test": "node src/fila-impressao.test.js && node src/pdf-etiqueta.test.js",
+    "test": "node src/fila-impressao.test.js && node src/pdf-etiqueta.test.js && node src/preparo-impressora.test.js",
     "build:win": "electron-builder --win --x64",
     "build:mac": "electron-builder --mac",
     "packagePublish": "electron-builder --win --x64 --publish always"
